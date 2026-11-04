@@ -120,6 +120,7 @@ if get_option('enable_tests')
     'serialize_analysis',
     'serialize_mark',
     'serialize_config',
+    'serialize_core',
     'serialize_debug',
     'serialize_flag',
     'serialize_seek',

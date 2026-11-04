@@ -3,6 +3,7 @@
 
 #include <rz_util/rz_serialize.h>
 #include <rz_core.h>
+#include <errno.h>
 
 /*
  * SDB Format:
@@ -68,8 +69,145 @@ static const char *config_exclude_load[] = {
 	NULL
 };
 
+typedef struct {
+        Sdb *db;
+        size_t count;
+} MacroSerializeData;
+
+static bool serialize_macro_cb(RzCmd *cmd, const RzCmdMacro *macro, void *user) {
+        (void)cmd;
+        MacroSerializeData *data = (MacroSerializeData *)user;
+
+        char key[64];
+        char value[32];
+
+        snprintf(key, sizeof(key), "%zu.name", data->count);
+        sdb_set(data->db, key, macro->name);
+
+        snprintf(key, sizeof(key), "%zu.code", data->count);
+        sdb_set(data->db, key, macro->code);
+
+        snprintf(key, sizeof(key), "%zu.nargs", data->count);
+        snprintf(value, sizeof(value), "%zu", macro->nargs);
+        sdb_set(data->db, key, value);
+
+        for (size_t i = 0; i < macro->nargs; i++) {
+                snprintf(key, sizeof(key), "%zu.arg.%zu", data->count, i);
+                sdb_set(data->db, key, macro->args[i]);
+        }
+
+        data->count++;
+        return true;
+}
+
+static void serialize_macros(Sdb *db, RzCore *core) {
+        if (!db || !core || !core->rcmd) {
+                return;
+        }
+
+        MacroSerializeData data = {
+                .db = db,
+                .count = 0,
+        };
+
+        rz_cmd_macro_foreach(core->rcmd, serialize_macro_cb, &data);
+
+        char count[32];
+        snprintf(count, sizeof(count), "%zu", data.count);
+        sdb_set(db, "count", count);
+}
+
+static bool deserialize_macros(Sdb *db, RzCore *core, RzSerializeResultInfo *res) {
+        const char *count_str = sdb_const_get(db, "count");
+        if (!count_str) {
+                return true;
+        }
+
+        char *end = NULL;
+        if (count_str[0] == '-') {
+                RZ_SERIALIZE_ERR(res, "invalid macro count in project");
+                return false;
+        }
+
+        errno = 0;
+        unsigned long long count = strtoull(count_str, &end, 10);
+        if (end == count_str || *end != '\0' || errno == ERANGE ||
+                count > SIZE_MAX) {
+                RZ_SERIALIZE_ERR(res, "invalid macro count in project");
+                return false;
+        }
+
+        for (size_t i = 0; i < (size_t)count; i++) {
+                char key[64];
+
+                snprintf(key, sizeof(key), "%zu.name", i);
+                const char *name = sdb_const_get(db, key);
+
+                snprintf(key, sizeof(key), "%zu.code", i);
+                const char *code = sdb_const_get(db, key);
+
+                snprintf(key, sizeof(key), "%zu.nargs", i);
+                const char *nargs_str = sdb_const_get(db, key);
+
+                if (!name || !*name || !code || !nargs_str) {
+                        RZ_SERIALIZE_ERR(res, "incomplete macro data in project");
+                        return false;
+                }
+
+                if (nargs_str[0] == '-') {
+                        RZ_SERIALIZE_ERR(res, "invalid macro argument count");
+                        return false;
+                }
+
+                errno = 0;
+                end = NULL;
+                unsigned long long nargs = strtoull(nargs_str, &end, 10);
+
+                if (end == nargs_str || *end != '\0' || errno == ERANGE ||
+                        nargs > (SIZE_MAX / sizeof(char *)) - 1) {
+                        RZ_SERIALIZE_ERR(res, "invalid macro argument count");
+                        return false;
+                }
+
+                const char **args = RZ_NEWS0(const char *, (size_t)nargs + 1);
+                if (!args) {
+                        RZ_SERIALIZE_ERR(res, "failed to allocate macro arguments");
+                        return false;
+                }
+
+                bool valid = true;
+                for (size_t j = 0; j < (size_t)nargs; j++) {
+                        snprintf(key, sizeof(key), "%zu.arg.%zu", i, j);
+                        args[j] = sdb_const_get(db, key);
+                        if (!args[j]) {
+                                valid = false;
+                                break;
+                        }
+                }
+
+                bool restored = false;
+                if (valid) {
+                        if (rz_cmd_macro_get(core->rcmd, name)) {
+                                restored = rz_cmd_macro_update(core->rcmd, name, args, code);
+                        } else {
+                                restored = rz_cmd_macro_add(core->rcmd, name, args, code);
+                        }
+                }
+
+                free(args);
+
+                if (!valid || !restored) {
+                        RZ_SERIALIZE_ERR(res, "failed to restore macro '%s'", name);
+                        return false;
+                }
+        }
+
+        return true;
+}
+
 RZ_API void rz_serialize_core_save(RZ_NONNULL Sdb *db, RZ_NONNULL RzCore *core, RZ_NULLABLE const char *prj_file) {
 	file_save(sdb_ns(db, "file", true), core, prj_file);
+	serialize_macros(sdb_ns(db, "macros", true), core);
 	rz_serialize_config_save(sdb_ns(db, "config", true), core->config, config_exclude_save);
 	rz_serialize_flag_save(sdb_ns(db, "flags", true), core->flags);
 	rz_serialize_mark_save(sdb_ns(db, "marks", true), core->marks);
@@ -99,6 +237,10 @@ RZ_API bool rz_serialize_core_load(RZ_NONNULL Sdb *db, RZ_NONNULL RzCore *core, 
 		SUB("file", file_load(subdb, core, prj_file, res));
 	}
 	SUB("config", rz_serialize_config_load(subdb, core->config, config_exclude_load));
+	Sdb *macro_db = sdb_ns(db, "macros", false);
+	if (macro_db && !deserialize_macros(macro_db, core, res)) {
+		return false;
+	}
 	SUB("flags", rz_serialize_flag_load(subdb, core->flags, res));
 	SUB("marks", rz_serialize_mark_load(subdb, core->marks, res));
 	SUB("analysis", rz_serialize_analysis_load(subdb, core->analysis, res));
